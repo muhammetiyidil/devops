@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Choose a host from your OpenSSH configuration and connect to it."""
+
+import argparse
+try:
+    import curses
+except ImportError:
+    curses = None
+import glob
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+def find_hosts(config):
+    hosts = []
+    visited = set()
+
+    def read(path):
+        path = path.resolve()
+        if path in visited:
+            return
+        visited.add(path)
+        for line in path.read_text().splitlines():
+            lexer = shlex.shlex(line, posix=True, punctuation_chars="=")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            parts = list(lexer)
+            if not parts:
+                continue
+            keyword, *values = parts
+            if values and values[0] == "=":
+                values.pop(0)
+            if keyword.lower() == "include":
+                for pattern in values:
+                    expanded = Path(pattern).expanduser()
+                    if not expanded.is_absolute():
+                        expanded = Path.home() / ".ssh" / expanded
+                    for match in sorted(glob.glob(str(expanded))):
+                        read(Path(match))
+            elif keyword.lower() == "host":
+                for host in values:
+                    if not any(char in host for char in "*?!") and not host.startswith("-"):
+                        if host not in hosts:
+                            hosts.append(host)
+
+    read(config)
+    return hosts
+
+
+def host_details(hosts, config_args):
+    details = []
+    for host in hosts:
+        result = subprocess.run(
+            ["ssh", "-G", *config_args, host], capture_output=True, text=True
+        )
+        if result.returncode:
+            details.append((host, [f"Error: {result.stderr.strip()}"]))
+            continue
+        settings = {}
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            settings.setdefault(key, []).append(value)
+        lines = []
+        for key, label in (
+            ("hostname", "HostName"), ("port", "Port"),
+            ("user", "User"), ("identityfile", "IdentityFile"),
+        ):
+            lines.append(f"{label}: {', '.join(settings.get(key, ['(not set)']))}")
+        details.append((host, lines))
+    return details
+
+
+def draw_line(screen, row, text, style=0):
+    height, width = screen.getmaxyx()
+    if 0 <= row < height and width > 0:
+        try:
+            screen.addnstr(row, 0, text, width - 1, style)
+        except curses.error:
+            pass
+
+
+def read_key(screen):
+    key = screen.getch()
+    # Windows curses reports the numeric keypad Enter separately.
+    if key == getattr(curses, "PADENTER", None):
+        return curses.KEY_ENTER
+    if key != 27:
+        return key
+
+    # Some terminals send keypad Enter as ESC O M without a terminfo mapping.
+    pending = []
+    screen.timeout(100)
+    try:
+        for expected in (ord("O"), ord("M")):
+            following = screen.getch()
+            if following != -1:
+                pending.append(following)
+            if following != expected:
+                break
+        else:
+            return curses.KEY_ENTER
+    finally:
+        screen.timeout(-1)
+
+    for following in reversed(pending):
+        curses.ungetch(following)
+    return key
+
+
+def show_details(screen, hosts, config_args):
+    details = host_details(hosts, config_args)
+    lines = []
+    for index, (host, settings) in enumerate(details, 1):
+        lines.append((f" {index:02d}  {host}", curses.A_BOLD))
+        lines.extend((f"      {setting}", 0) for setting in settings)
+        lines.append(("", 0))
+    offset = 0
+    while True:
+        screen.erase()
+        height, _ = screen.getmaxyx()
+        draw_line(screen, 0, " SSH INFO", curses.A_BOLD)
+        visible = max(0, height - 2)
+        for row, (line, style) in enumerate(lines[offset:offset + visible], 1):
+            draw_line(screen, row, line, style)
+        draw_line(screen, height - 1, " ↑↓ Scroll   Enter/Esc Back", curses.A_DIM)
+        screen.refresh()
+        key = read_key(screen)
+        if key in (10, 13, curses.KEY_ENTER, 27, ord("q")):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max(0, len(lines) - visible), offset + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key == curses.KEY_NPAGE:
+            offset = min(max(0, len(lines) - visible), offset + visible)
+        elif key == curses.KEY_PPAGE:
+            offset = max(0, offset - visible)
+
+
+def menu(screen, hosts, config_args):
+    curses.curs_set(0)
+    screen.keypad(True)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    selected = 0
+    items = [f" {index:02d}  {host}" for index, host in enumerate(hosts, 1)]
+    items.extend((" INFO", " EXIT"))
+    while True:
+        screen.erase()
+        height, _ = screen.getmaxyx()
+        draw_line(screen, 0, " SSH MANAGER", curses.A_BOLD | (curses.color_pair(1) if curses.has_colors() else 0))
+        visible = max(1, height - 3)
+        start = max(0, min(selected - visible + 1, len(items) - visible))
+        for index in range(start, min(len(items), start + visible)):
+            style = curses.color_pair(2) if index == selected and curses.has_colors() else (curses.A_REVERSE if index == selected else 0)
+            draw_line(screen, index - start + 1, (" ›" if index == selected else "  ") + items[index], style)
+        draw_line(screen, height - 1, " ↑↓ Navigate   Enter Select", curses.A_DIM)
+        screen.refresh()
+        key = read_key(screen)
+        if key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % len(items)
+        elif key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % len(items)
+        elif key in (10, 13, curses.KEY_ENTER):
+            if selected == len(hosts):
+                show_details(screen, hosts, config_args)
+            elif selected == len(hosts) + 1:
+                return None
+            else:
+                return hosts[selected]
+        elif key in (27, ord("q")):
+            return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-F", "--config", type=Path, help="Use a different SSH config file")
+    args = parser.parse_args()
+    if curses is None:
+        print(
+            "Error: curses is unavailable. On Windows, run: python -m pip install windows-curses",
+            file=sys.stderr,
+        )
+        return 1
+    if not shutil.which("ssh"):
+        print("Error: ssh is not installed.", file=sys.stderr)
+        return 1
+    config = (args.config or Path.home() / ".ssh" / "config").expanduser().absolute()
+    config_args = ["-F", str(config)] if args.config else []
+    try:
+        hosts = find_hosts(config)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"Error reading SSH config: {error}", file=sys.stderr)
+        return 1
+    if not hosts:
+        print(f"No named hosts found in {config}.")
+        return 1
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("Error: An interactive terminal is required.", file=sys.stderr)
+        return 1
+    host = curses.wrapper(menu, hosts, config_args)
+    if host is not None:
+        print(f"Connecting to {host}...", flush=True)
+        if os.name == "nt":
+            return subprocess.call(["ssh", *config_args, host])
+        os.execvp("ssh", ["ssh", *config_args, host])
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+    except OSError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
